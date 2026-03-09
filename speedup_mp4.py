@@ -26,10 +26,10 @@ parser.add_argument("--no-enhance", action="store_true", help="Disable percentil
 args = parser.parse_args()
 
 # ============== OVERLAY SETTINGS ==============
-font_scale = 0.7
+font_scale = 3.0
+font_thickness = 6
 font_color = (255, 255, 255)
-timestamp_pos = (10, 20)
-airpuff_icon_pos = (10, 50)
+airpuff_icon_size = 80
 
 # ============== HELPER FUNCTIONS ==============
 def enhance_frame(frame):
@@ -38,23 +38,33 @@ def enhance_frame(frame):
     lo, hi = np.percentile(f, 1), np.percentile(f, 99)
     return np.clip((f - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
 
-def draw_airpuff_icon(img_bgr, x, y, size=30):
-    """Draws a nozzle with air burst lines and 'AIR PUFF' label."""
+def get_text_top_right(text, frame_w, font, font_scale, thickness, margin=20):
+    """Return position to place text in top-right corner."""
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    x = frame_w - tw - margin
+    y = th + margin
+    return (x, y)
+
+def draw_airpuff_icon(img_bgr, x, y, size=80):
+    """Draws a nozzle pointing LEFT (into the video) with air burst lines and 'AIR PUFF' label."""
+    # Nozzle triangle pointing left
     nozzle_pts = np.array([
-        [x, y],
-        [x + size // 3, y - size // 4],
-        [x + size // 3, y + size // 4]
+        [x, y],                          # tip (left)
+        [x - size // 3, y - size // 4],  # top-right of nozzle
+        [x - size // 3, y + size // 4]   # bottom-right of nozzle
     ], dtype=np.int32)
     cv2.fillPoly(img_bgr, [nozzle_pts], (0, 200, 255))
 
-    line_start_x = x + size // 3 + 2
+    # Air burst lines going left from tip
+    line_start_x = x - 2
     for dy in [-size // 4, -size // 8, 0, size // 8, size // 4]:
         start_pt = (line_start_x, y + dy)
-        end_pt = (line_start_x + size // 2, y + dy + (dy // 2))
-        cv2.line(img_bgr, start_pt, end_pt, (0, 200, 255), 1, cv2.LINE_AA)
+        end_pt = (line_start_x - size // 2, y + dy + (dy // 2))
+        cv2.line(img_bgr, start_pt, end_pt, (0, 200, 255), 3, cv2.LINE_AA)
 
-    cv2.putText(img_bgr, "AIR PUFF", (x + size + 5, y + 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
+    # Label to the right of nozzle
+    cv2.putText(img_bgr, "AIR PUFF", (x - size // 3 + 10, y + size // 2 + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 200, 255), 3, cv2.LINE_AA)
     return img_bgr
 
 # --- 1. Read input video ---
@@ -88,7 +98,11 @@ while True:
 cap.release()
 print(f"Read {len(frames)} frames")
 
-# --- 4. Encode output video ---
+# --- 4. Airpuff icon position (top-right area, below where timestamp goes) ---
+puff_x = w - 60
+puff_y = 120
+
+# --- 5. Encode output video ---
 print(f"Encoding video to: {args.output_path}")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 out = cv2.VideoWriter(args.output_path, fourcc, new_fps, (w, h), isColor=True)
@@ -101,20 +115,22 @@ for i, frame_bgr in enumerate(frames):
 
     t = i / new_fps
 
-    # Overlay
+    # Overlay (top-right)
     if args.overlay == "timestamp":
         time_text = f"{t:.2f} sec"
-        cv2.putText(frame_bgr, time_text, timestamp_pos,
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
+        pos = get_text_top_right(time_text, w, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+        cv2.putText(frame_bgr, time_text, pos,
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, font_thickness, cv2.LINE_AA)
     elif args.overlay == "distance":
         depth_um = i * args.um_per_frame
         depth_text = f"{depth_um:.0f} um"
-        cv2.putText(frame_bgr, depth_text, timestamp_pos,
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
+        pos = get_text_top_right(depth_text, w, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+        cv2.putText(frame_bgr, depth_text, pos,
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, font_thickness, cv2.LINE_AA)
 
-    # Airpuff icon
+    # Airpuff icon (top-right, below text, pointing into video)
     if not args.no_puff and args.puff_start <= t < args.puff_start + args.puff_duration:
-        draw_airpuff_icon(frame_bgr, airpuff_icon_pos[0], airpuff_icon_pos[1], size=30)
+        draw_airpuff_icon(frame_bgr, puff_x, puff_y, size=airpuff_icon_size)
 
     out.write(frame_bgr)
 
