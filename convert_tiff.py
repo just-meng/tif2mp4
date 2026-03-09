@@ -14,15 +14,20 @@ import cv2
 import argparse
 
 # ============== ARGUMENT PARSING ==============
-parser = argparse.ArgumentParser(description="Convert a TIFF stack to .mp4 with smoothing, timestamp, and airpuff indicator.")
+parser = argparse.ArgumentParser(description="Convert a TIFF stack to .mp4 with smoothing, overlays, and airpuff indicator.")
 parser.add_argument("tiff_path", help="Path to the input TIFF stack")
 parser.add_argument("output_path", help="Path for the output .mp4 file")
 parser.add_argument("--duration", type=float, default=10.0, help="Total video duration in seconds (default: 10.0)")
+parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30.0; overrides --duration)")
 parser.add_argument("--avg-window", type=int, default=3, help="Running average window size (default: 3)")
 parser.add_argument("--puff-start", type=float, default=2.0, help="Airpuff onset time in seconds (default: 2.0)")
 parser.add_argument("--puff-duration", type=float, default=1.0, help="Airpuff display duration in seconds (default: 1.0)")
 parser.add_argument("--no-flip", action="store_true", help="Disable vertical flip (default: video is flipped upside-down)")
 parser.add_argument("--no-enhance", action="store_true", help="Disable percentile contrast enhancement")
+parser.add_argument("--no-puff", action="store_true", help="Disable airpuff icon overlay")
+parser.add_argument("--overlay", choices=["timestamp", "distance", "none"], default="timestamp",
+                    help="Overlay type: 'timestamp' (elapsed time), 'distance' (depth in µm), or 'none' (default: timestamp)")
+parser.add_argument("--um-per-frame", type=float, default=5.0, help="Microns per frame for distance overlay (default: 5.0)")
 args = parser.parse_args()
 
 tiff_path = args.tiff_path
@@ -81,8 +86,11 @@ n_frames = len(frames)
 print(f"Loaded {n_frames} frames")
 
 h, w = frames[0].shape[:2]
-fps = n_frames / total_duration
-print(f"Frame size: {w}x{h}, FPS: {fps:.2f}")
+
+# --- FPS handling ---
+fps = args.fps
+total_duration = n_frames / fps
+print(f"Frame size: {w}x{h}, FPS: {fps:.2f}, Duration: {total_duration:.2f}s")
 
 # --- 2. Stack and enhance contrast ---
 stack = np.array(frames, dtype=np.float64)
@@ -126,13 +134,19 @@ for i in range(n_frames):
 
     t = i / fps
 
-    # Timestamp
-    time_text = f"{t:.2f} sec"
-    cv2.putText(frame_bgr, time_text, timestamp_pos,
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
+    # Overlay
+    if args.overlay == "timestamp":
+        time_text = f"{t:.2f} sec"
+        cv2.putText(frame_bgr, time_text, timestamp_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
+    elif args.overlay == "distance":
+        depth_um = i * args.um_per_frame
+        depth_text = f"{depth_um:.0f} \u00b5m"
+        cv2.putText(frame_bgr, depth_text, timestamp_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
 
     # Airpuff icon
-    if airpuff_start <= t < airpuff_start + airpuff_duration:
+    if not args.no_puff and airpuff_start <= t < airpuff_start + airpuff_duration:
         draw_airpuff_icon(frame_bgr, airpuff_icon_pos[0], airpuff_icon_pos[1], size=30)
 
     out.write(frame_bgr)
