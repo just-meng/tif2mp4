@@ -141,7 +141,7 @@ for i in range(n_frames):
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
     elif args.overlay == "distance":
         depth_um = i * args.um_per_frame
-        depth_text = f"{depth_um:.0f} \u00b5m"
+        depth_text = f"{depth_um:.0f} um"
         cv2.putText(frame_bgr, depth_text, timestamp_pos,
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 2, cv2.LINE_AA)
 
