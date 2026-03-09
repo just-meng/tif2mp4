@@ -1,3 +1,13 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#     "numpy",
+#     "Pillow",
+#     "opencv-python",
+# ]
+# ///
+
 import numpy as np
 from PIL import Image
 import cv2
