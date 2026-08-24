@@ -1,13 +1,11 @@
-"""``tif2mp4 <input>... <output>`` -- render recordings and stacks for talks.
+"""``tif2mp4 <input.tif> <output.mp4> [--camera beh.mp4]``.
 
-Inputs are variadic and the last positional is the output, which is what lets
-the command sit under ``datalad run`` unchanged: ``{inputs}`` expands to every
-declared input, space-separated, and ``{outputs}`` to the file being produced.
-
-Every rendering decision is read from the files themselves.  The single knob is
-``--speed``: how many times faster than native the result plays.  Native is
-whatever the metadata says it is -- the acquisition rate for a recording, one
-z-step per second for a stack -- so ``--speed 1`` always means "as it happened".
+There is one subject: a ScanImage TIFF. Every option describes how to render it.
+A behavioural camera video can ride along as a supplement, shown beside it, and
+the only thing that happens to that video is that it is put on the TIFF's clock:
+scaled to the TIFF panel's height at its own aspect ratio, and down-sampled to
+the TIFF's frame rate. No rotation, no smoothing, no overlays -- the stamp and
+the marker are already on the TIFF panel, so repeating them would say nothing.
 """
 
 from __future__ import annotations
@@ -20,41 +18,55 @@ import cv2
 import numpy as np
 
 from . import overlay, render
-from .sources import (
-    STIMULUS_TYPES,
-    TABLE_SUFFIXES,
-    InputError,
-    Source,
-    load_source,
-    stimulus_from_trials,
-    trial_id_from_name,
-)
+from .sources import STIMULUS_TYPES, InputError, load_tiff, load_video
 
 FOURCC = "mp4v"
+
+
+def _ratio(text: str) -> float:
+    """Parse an ``N:M`` ratio into a positive fraction."""
+    try:
+        numerator, denominator = (float(part) for part in text.split(":"))
+        value = numerator / denominator
+    except (ValueError, ZeroDivisionError):
+        raise argparse.ArgumentTypeError(f"{text!r} is not an N:M ratio, e.g. 1:3") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must be positive")
+    return value
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tif2mp4",
         description=(
-            "Render ScanImage TIFF stacks and companion camera videos to an .mp4. "
-            "Several inputs are composited side by side on a shared real-time axis. "
-            "A trials.tsv among the inputs supplies the stimulus type."
+            "Render a ScanImage TIFF to an .mp4, optionally beside the behavioural "
+            "camera video from the same trial. All options describe the TIFF."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Native playback (--speed 1) per input type:\n"
-            "  recording TIFF  SI.hRoiManager.scanFrameRate, stamped in seconds\n"
-            "  z-stack TIFF    one z-step per second, stamped in microns\n"
-            "  .mp4 + TIFF     frame count divided by the TIFF's duration\n"
-            "  .mp4 alone      unknown -- unstamped unless --acq-rate is given\n"
+            "Native playback (--speed 1):\n"
+            "  recording  SI.hRoiManager.scanFrameRate, stamped in seconds\n"
+            "  z-stack    one z-step per second, stamped in microns\n"
         ),
     )
+    parser.add_argument("input", type=Path, help="the ScanImage .tif/.tiff to render")
+    parser.add_argument("output", type=Path, help="the .mp4 to write")
     parser.add_argument(
-        "paths",
-        nargs="+",
-        metavar="input... output",
-        help="one or more inputs (.tif/.tiff/.mp4, plus an optional trials.tsv), then the output .mp4",
+        "--camera",
+        type=Path,
+        default=None,
+        metavar="MP4",
+        help="behavioural camera video to show beside the TIFF, on the TIFF's clock",
+    )
+    parser.add_argument(
+        "--camera-ratio",
+        type=_ratio,
+        default="1:3",
+        metavar="N:M",
+        help=(
+            "camera height as a fraction of the TIFF's, e.g. 1:3 (the default) "
+            "for a third as tall. 1:1 matches the TIFF"
+        ),
     )
     parser.add_argument(
         "--speed",
@@ -63,204 +75,168 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="play N times faster than native acquisition (default: 1.0, real time)",
     )
     parser.add_argument(
-        "--acq-rate",
-        type=float,
-        default=None,
-        metavar="HZ",
-        help="acquisition rate for .mp4 inputs, whose containers do not record it",
+        "--rotate",
+        type=int,
+        choices=(0, 90, 180, 270),
+        default=0,
+        metavar="DEG",
+        help="rotate the TIFF clockwise by 0, 90, 180 or 270 degrees (default: 0)",
+    )
+    parser.add_argument(
+        "--running-average",
+        type=int,
+        default=render.RUNNING_AVERAGE,
+        metavar="N",
+        help=(
+            f"running-average window in TIFF frames (default: {render.RUNNING_AVERAGE}, "
+            f"no smoothing). Try 3 for a recording; leave it alone for a z-stack, "
+            f"whose frames are depths rather than time points"
+        ),
     )
     parser.add_argument(
         "--stimulus-type",
         choices=STIMULUS_TYPES,
         default=None,
-        help="stimulus to mark when no trials.tsv is given (default: none)",
+        help="stimulus to mark on the TIFF panel; no marker unless given",
     )
     parser.add_argument(
         "--stimulus-onset",
         type=float,
-        default=2.0,
+        default=None,
         metavar="SEC",
-        help="stimulus onset in real seconds (default: 2.0)",
+        help="stimulus onset in real seconds",
     )
     parser.add_argument(
         "--stimulus-duration",
         type=float,
-        default=1.0,
+        default=None,
         metavar="SEC",
-        help="stimulus duration in real seconds (default: 1.0)",
+        help="stimulus duration in real seconds",
     )
     args = parser.parse_args(argv)
-    if len(args.paths) < 2:
-        parser.error("need at least one input and an output path")
     if args.speed <= 0:
         parser.error("--speed must be positive")
-    if args.acq_rate is not None and args.acq_rate <= 0:
-        parser.error("--acq-rate must be positive")
+    if args.running_average < 1:
+        parser.error("--running-average must be at least 1")
+
+    # A stimulus is described in full or not at all: no timing is assumed.
+    stimulus = {
+        "--stimulus-type": args.stimulus_type,
+        "--stimulus-onset": args.stimulus_onset,
+        "--stimulus-duration": args.stimulus_duration,
+    }
+    missing = [flag for flag, value in stimulus.items() if value is None]
+    if missing and len(missing) < len(stimulus):
+        parser.error(
+            "a stimulus must be described in full: "
+            + ", ".join(sorted(missing))
+            + " also needed"
+        )
+    if args.stimulus_duration is not None and args.stimulus_duration <= 0:
+        parser.error("--stimulus-duration must be positive")
     return args
 
 
-def resolve_clocks(sources: list[Source], acq_rate: float | None) -> None:
-    """Give every video source a rate, from --acq-rate or from a TIFF's duration."""
-    reference = next(
-        (s for s in sources if s.kind == "recording" and s.duration is not None), None
-    )
-    for source in sources:
-        if source.kind != "video":
-            continue
-        if acq_rate is not None:
-            source.rate = acq_rate
-            source.notes.append(f"rate {acq_rate:.4g} Hz from --acq-rate")
-        elif reference is not None:
-            source.rate = source.n_frames / reference.duration
-            source.notes.append(
-                f"rate {source.rate:.4g} Hz derived from {reference.path.name} "
-                f"({source.n_frames} frames over {reference.duration:.4g} s)"
-            )
-        else:
-            source.notes.append(
-                "no clock: .mp4 containers do not record the acquisition rate, and no "
-                "TIFF or --acq-rate was given -- rendering without stamps"
-            )
-
-
-def check_shared_axis(sources: list[Source]) -> None:
-    """Composites must share one real-time axis; say so loudly when they do not."""
-    if len(sources) < 2:
-        return
-    unclocked = [s for s in sources if s.rate is None]
-    if unclocked:
-        names = ", ".join(s.path.name for s in unclocked)
-        raise InputError(
-            f"cannot composite {names}: no time axis. Pass the TIFF from the same "
-            f"trial, or state the rate with --acq-rate"
-        )
-    if any(s.kind == "zstack" for s in sources):
-        raise InputError(
-            "a z-stack has a depth axis, not a time axis, and cannot be composited "
-            "with recordings"
-        )
-    slowest = min(s.rate for s in sources)
-    spans = [s.duration for s in sources]
-    if max(spans) - min(spans) > 1.0 / slowest:
-        detail = "\n".join(
-            f"  {s.path.name}: {s.n_frames} frames, {s.rate:.4g} Hz, {s.duration:.4g} s"
-            for s in sources
-        )
-        raise InputError("inputs do not span the same real-time window:\n" + detail)
-
-
-def resolve_stimulus(args: argparse.Namespace, tables: list[Path], sources: list[Source]) -> str:
-    if tables and args.stimulus_type is not None:
-        raise InputError(
-            "--stimulus-type conflicts with the trials table; drop one so the "
-            "stimulus has a single source of truth"
-        )
-    if tables:
-        if len(tables) > 1:
-            raise InputError("more than one trials table given")
-        named = next((s for s in sources if trial_id_from_name(s.path) is not None), None)
-        if named is None:
-            raise InputError(
-                f"{tables[0]}: cannot tell which trial to look up -- no input filename "
-                f"ends in a trial number (e.g. ..._00013.tif)"
-            )
-        trial_id = trial_id_from_name(named.path)
-        stimulus = stimulus_from_trials(tables[0], trial_id)
-        print(f"  stimulus: {stimulus} (trial {trial_id} of {tables[0].name})")
-        return stimulus
-    return args.stimulus_type or "none"
-
-
 def build(args: argparse.Namespace) -> None:
-    paths = [Path(p) for p in args.paths]
-    output, inputs = paths[-1], paths[:-1]
-    tables = [p for p in inputs if p.suffix.lower() in TABLE_SUFFIXES]
-    visual = [p for p in inputs if p not in tables]
-    if not visual:
-        raise InputError("no .tif/.tiff/.mp4 input given")
-    for path in inputs:
-        if not path.exists():
+    for path in (args.input, args.camera):
+        if path is not None and not path.exists():
             raise InputError(f"{path}: no such file")
 
-    sources = [load_source(path) for path in visual]
-    resolve_clocks(sources, args.acq_rate)
-    check_shared_axis(sources)
+    print(f"Reading {args.input.name}:")
+    tiff = load_tiff(args.input)
+    if tiff.rate is None:
+        raise InputError(f"{args.input}: ScanImage header has no usable rate")
+    print(
+        f"  {tiff.n_frames} frames, {tiff.shape[1]}x{tiff.shape[0]}, "
+        f"{tiff.kind}, {tiff.rate:.6g} Hz native"
+        + (f", {tiff.step_um:.4g} um/frame" if tiff.step_um else "")
+    )
 
-    for source in sources:
-        detail = f"{source.n_frames} frames, {source.shape[1]}x{source.shape[0]}, {source.kind}"
-        if source.rate is not None:
-            detail += f", {source.rate:.6g} Hz native"
-        if source.step_um is not None:
-            detail += f", {source.step_um:.4g} um/frame"
-        print(f"  {source.path.name}: {detail}")
-        for note in source.notes:
-            print(f"    note: {note}")
-
-    stimulus = resolve_stimulus(args, tables, sources)
-    is_zstack = sources[0].kind == "zstack"
-    if is_zstack and stimulus != "none":
+    is_zstack = tiff.kind == "zstack"
+    if is_zstack and args.stimulus_type is not None:
         raise InputError("a z-stack has no time axis, so a stimulus cannot be placed on it")
 
-    # The fastest source sets the output grid so nothing is temporally undersampled.
-    base = max(sources, key=lambda s: s.rate or 0.0)
-    clocked = base.rate is not None
-    base_rate = base.rate if clocked else (base.container_fps or 30.0)
-    if not clocked:
-        print(
-            f"  warning: no clock; replaying the container's {base_rate:.4g} fps and "
-            f"omitting stamps"
-        )
-    out_fps = base_rate * args.speed
-    n_out = base.n_frames
+    # The TIFF is the clock: one output frame per TIFF frame.
+    n_out = tiff.n_frames
+    out_fps = tiff.rate * args.speed
 
-    prepared = [
-        render.prepare_tiff(s.frames) if s.kind != "video" else render.prepare_video(s.frames)
-        for s in sources
-    ]
-    height = min(frames.shape[1] for frames in prepared)
-    panels = [
-        np.stack([render.to_height(frame, height) for frame in frames]) for frames in prepared
-    ]
+    lo, hi = render.PERCENTILES
+    print(f"Contrast-stretching each frame on its own {lo}-{hi}th pct ...")
+    stack = render.stretch(tiff.frames)
 
-    if is_zstack:
-        summary = f"{sources[0].step_um * args.speed:.4g} um/s"
-    elif clocked:
-        summary = f"{args.speed:.4g}x real time"
-    else:
-        summary = f"{args.speed:.4g}x container rate"
-    print(f"  output: {n_out} frames @ {out_fps:.4g} fps ({summary})")
+    if args.running_average > 1:
+        print(f"Averaging over {args.running_average} frames ...")
+    stack = render.smooth(stack, args.running_average)
 
-    width = sum(p.shape[2] for p in panels)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    panel = render.to_bgr(stack)
+    if args.rotate:
+        panel = render.rotate(panel, args.rotate)
+        print(f"Rotating {args.rotate} deg ...")
+    height = panel.shape[1]
+
+    camera = camera_panel = None
+    if args.camera is not None:
+        if is_zstack:
+            raise InputError("a z-stack has no time axis to put a camera video on")
+        print(f"Reading {args.camera.name}:")
+        camera = load_video(args.camera)
+        print(f"  {camera.n_frames} frames, {camera.shape[1]}x{camera.shape[0]}")
+
+        # The camera's pixels are left alone: it is already display-ready, so
+        # only its geometry and its clock change.
+        camera_height = max(1, int(round(height * args.camera_ratio)))
+        scaled = [render.to_height(frame, camera_height) for frame in camera.frames]
+        print(f"Scaling the camera to {args.camera_ratio:.3g} of TIFF height ...")
+
+        # Pad into a full-height column so the two panels concatenate.
+        camera_panel = np.stack([render.in_column(frame, height) for frame in scaled])
+        print("Down-sampling the camera onto the TIFF's clock:")
+        print(f"  {camera.n_frames} -> {n_out} frames")
+
+    if args.speed != 1:
+        # Only the encode rate changes: no frame is added, dropped or resampled.
+        # A stack is traversed, not played: its rate is depth per second.
+        unit = "z-steps/s" if is_zstack else "fps"
+        print(f"{'Speeding up' if args.speed > 1 else 'Slowing down'} {args.speed:.4g}x:")
+        print(f"  {tiff.rate:.6g} -> {out_fps:.4g} {unit}")
+
+    summary = (
+        f"{tiff.step_um * args.speed:.4g} um/s" if is_zstack else f"{args.speed:.4g}x real time"
+    )
+    width = panel.shape[2] + (0 if camera_panel is None else camera_panel.shape[2])
+    print(f"Summary: encoded {n_out} frames @ {out_fps:.4g} fps ({summary})")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
-        str(output), cv2.VideoWriter_fourcc(*FOURCC), out_fps, (width, height), isColor=True
+        str(args.output), cv2.VideoWriter_fourcc(*FOURCC), out_fps, (width, height), isColor=True
     )
     if not writer.isOpened():
-        raise InputError(f"{output}: cannot open for writing")
+        raise InputError(f"{args.output}: cannot open for writing")
 
     try:
         for j in range(n_out):
-            t = j / base_rate  # real time, independent of --speed
-            tiles = []
-            for source, frames in zip(sources, panels):
-                index = j if source is base else min(frames.shape[0] - 1, int(t * source.rate))
-                tiles.append(frames[index])
-            frame = tiles[0] if len(tiles) == 1 else cv2.hconcat(tiles)
-            frame = np.ascontiguousarray(frame)
+            t = j / tiff.rate  # real time, independent of --speed
+            frame = np.ascontiguousarray(panel[j])
 
+            # Overlays belong to the TIFF, so they are drawn before the camera
+            # is joined on and are sized by the TIFF panel alone.
             if is_zstack:
-                overlay.draw_stamp(frame, f"{j * sources[0].step_um:.0f} um")
-            elif clocked:
+                overlay.draw_stamp(frame, f"{j * tiff.step_um:.0f} um")
+            else:
                 overlay.draw_stamp(frame, f"{t:.2f} sec")
+                if args.stimulus_type is not None:
+                    if args.stimulus_onset <= t < args.stimulus_onset + args.stimulus_duration:
+                        overlay.draw_stimulus(frame, args.stimulus_type)
 
-            if clocked and stimulus != "none":
-                if args.stimulus_onset <= t < args.stimulus_onset + args.stimulus_duration:
-                    overlay.draw_stimulus(frame, stimulus)
+            if camera is not None:
+                # Down-sample to the TIFF's frame rate: output frame j takes the
+                # proportionally-placed camera frame.
+                index = min(camera_panel.shape[0] - 1, j * camera_panel.shape[0] // n_out)
+                frame = cv2.hconcat([frame, camera_panel[index]])
 
             writer.write(frame)
     finally:
         writer.release()
-    print(f"  wrote {output}")
 
 
 def main(argv: list[str] | None = None) -> int:

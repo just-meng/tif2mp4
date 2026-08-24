@@ -16,10 +16,7 @@ what actually happened are ``enable``, ``actualNumSlices`` and
 
 from __future__ import annotations
 
-import csv
-import json
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -28,12 +25,9 @@ import tifffile
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 VIDEO_SUFFIXES = {".mp4"}
-TABLE_SUFFIXES = {".tsv"}
 
-#: Fallback for a trials.tsv with no .json sidecar, per the raw/ dataset.
-DEFAULT_TRIAL_LEVELS = {"1": "none", "2": "airpuff", "3": "sound"}
-
-STIMULUS_TYPES = ("none", "airpuff", "sound")
+#: Stimuli the overlay can draw. Absence of --stimulus-type means no marker.
+STIMULUS_TYPES = ("airpuff", "sound")
 
 
 class InputError(Exception):
@@ -49,8 +43,6 @@ class Source:
     kind: str  # "recording" | "zstack" | "video"
     rate: float | None = None  # native frames per real second; None when unknown
     step_um: float | None = None  # microns per frame; z-stacks only
-    container_fps: float | None = None  # what an .mp4 claims, reliable or not
-    notes: list[str] = field(default_factory=list)
 
     @property
     def n_frames(self) -> int:
@@ -96,7 +88,16 @@ def _step_um(fd: dict, path: Path) -> float:
 
 
 def load_tiff(path: Path) -> Source:
-    with tifffile.TiffFile(path) as tf:
+    if path.suffix.lower() not in TIFF_SUFFIXES:
+        raise InputError(
+            f"{path}: the input must be a ScanImage TIFF. A camera video goes in "
+            f"--camera, not here"
+        )
+    try:
+        tf = tifffile.TiffFile(path)
+    except tifffile.TiffFileError as error:
+        raise InputError(f"{path}: not a readable TIFF ({error})") from error
+    with tf:
         # Read pages explicitly: ScanImage's stale slice/volume counts make
         # tifffile's own reshape guess unreliable for these files.
         frames = np.stack([page.asarray() for page in tf.pages]).astype(np.float64)
@@ -125,7 +126,6 @@ def load_video(path: Path) -> Source:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise InputError(f"{path}: cannot open as video")
-    container_fps = cap.get(cv2.CAP_PROP_FPS) or None
     frames = []
     while True:
         ok, frame = cap.read()
@@ -135,61 +135,6 @@ def load_video(path: Path) -> Source:
     cap.release()
     if not frames:
         raise InputError(f"{path}: contains no decodable frames")
-    # rate stays None: acquisition rate is not recoverable from the container.
-    return Source(path, np.stack(frames), "video", container_fps=container_fps)
+    # rate stays None: the TIFF supplies the clock, not the container.
+    return Source(path, np.stack(frames), "video")
 
-
-def load_source(path: Path) -> Source:
-    suffix = path.suffix.lower()
-    if suffix in TIFF_SUFFIXES:
-        return load_tiff(path)
-    if suffix in VIDEO_SUFFIXES:
-        return load_video(path)
-    raise InputError(f"{path}: unsupported input type {suffix!r}")
-
-
-# --------------------------------------------------------------------------- #
-# trials.tsv
-# --------------------------------------------------------------------------- #
-
-
-def trial_id_from_name(path: Path) -> int | None:
-    """Pull the trailing trial number out of e.g. ``..._trial-airpuff_00013.tif``."""
-    match = re.search(r"_(\d+)$", path.stem)
-    return int(match.group(1)) if match else None
-
-
-def _find_sidecar(table: Path) -> Path | None:
-    """Locate the .json describing a table, searching upward per BIDS inheritance."""
-    name = table.with_suffix(".json").name
-    for directory in [table.parent, *table.parent.parents]:
-        candidate = directory / name
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def stimulus_from_trials(table: Path, trial_id: int) -> str:
-    """Look up the stimulus label for ``trial_id``, per trials.tsv and its sidecar."""
-    levels = dict(DEFAULT_TRIAL_LEVELS)
-    sidecar = _find_sidecar(table.resolve())
-    if sidecar is not None:
-        described = json.loads(sidecar.read_text()).get("trial_type", {}).get("Levels")
-        if described:
-            levels = {str(k): str(v) for k, v in described.items()}
-
-    with table.open(newline="") as handle:
-        for row in csv.DictReader(handle, delimiter="\t"):
-            if row.get("trial_id", "").strip() != str(trial_id):
-                continue
-            code = row.get("trial_type", "").strip()
-            label = levels.get(code)
-            if label is None:
-                raise InputError(f"{table}: trial {trial_id} has unknown trial_type {code!r}")
-            label = label.strip().lower().replace(" ", "")
-            if label in ("nostim", "none", ""):
-                return "none"
-            if label not in STIMULUS_TYPES:
-                raise InputError(f"{table}: trial {trial_id} stimulus {label!r} is not drawable")
-            return label
-    raise InputError(f"{table}: no row for trial_id {trial_id}")
