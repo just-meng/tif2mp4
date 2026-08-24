@@ -1,0 +1,20 @@
+[project]
+name = "tif2mp4"
+version = "0.1.0"
+description = "Render ScanImage TIFF stacks and companion camera videos to presentation MP4s."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "tifffile",
+]
+
+[project.scripts]
+tif2mp4 = "tif2mp4.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tif2mp4"]
